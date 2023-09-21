@@ -3,6 +3,7 @@ import requests
 from datetime import datetime, timedelta
 from threading import Timer
 import logging
+from requests.adapters import HTTPAdapter, Retry
 
 key = ""
 app = Flask(__name__)
@@ -11,13 +12,18 @@ logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 logger.addHandler(logging.StreamHandler())
 
-CHAT_ID0 = "" # Owner's ID
-CHAT_ID1 = "" # Target group's ID
+s = requests.Session()
+retries = Retry(total=16, connect=8, backoff_factor=0.5)
+s.mount('http://', HTTPAdapter(max_retries=retries))
 
-HOST = "0.0.0.0:8888" # Arduino bot host address:port
+CHAT_ID0 = "" # Owner's ID
+CHAT_ID1 = "" # Group
+CHAT_IDs = [""] # allowed id
+HOST = '0.0.0.0:8888'
 
 last_on = datetime.now()
-on_time = timedelta(minutes=1)
+on_mins = 10
+on_time = timedelta(minutes=on_mins)
 
 timer = None
 
@@ -37,26 +43,31 @@ def send(chatid, msg):
 def online():
     global state
     send(CHAT_ID0, "ESP32 Connected!")
-    send(CHAT_ID1, "ESP32 Connected!")
+    #send(CHAT_ID1, "ESP32 Connected!")
     logging.info("ESP32 Connected!")
-    state = False
-    return "Sent!"
+    return str(state)
 
 @app.route("/timesup",methods=["GET"])
-def timesup():
+def timesup(local=False):
     global state
-    send(CHAT_ID0, "Time's up! State set to OFF.")
-    logging.info("Time's up! State set to OFF.")
+    if local:
+        send(CHAT_ID0, "Time's up! State set to OFF.")
+        logging.info("Time's up! State set to OFF.")
+    else:
+        send(CHAT_ID0, "Time's up! State set to OFF by ESP32.")
+        logging.info("Time's up! State set to OFF by ESP32.")
     state = False
     return "Sent!"
 
 @app.route("/switchon",methods=["GET"])
 def switchon():
     global state, last_on, timer
-    send(CHAT_ID0, "Set pump to ON by switch.")
-    logging.info("Set pump to ON by switch.")
+    send(CHAT_ID0, "Pump set to ON by switch.")
+    logging.info("Pump set to ON by switch.")
     state = True
     last_on = datetime.now()
+    if isinstance(timer, Timer):
+        timer.cancel()
     timer = Timer(on_time.seconds, timesup_local)
     timer.start()
     return "Sent!"
@@ -64,53 +75,76 @@ def switchon():
 @app.route("/switchoff",methods=["GET"])
 def switchoff():
     global state
-    send(CHAT_ID0, "Set pump to OFF by switch.")
-    logging.info("Set pump to OFF by switch.")
+    send(CHAT_ID0, "Pump set to OFF by switch.")
+    logging.info("Pump set to OFF by switch.")
     state = False
+    if isinstance(timer, Timer):
+        timer.cancel()
     return "Sent!"
 
 def timesup_local():
-    resp = requests.get(f'http://{HOST}/L')
+    logging.debug("The local timer has gone off!")
+    resp = s.get(f'http://{HOST}/L')
     logging.debug(resp.text)
-    timesup()
+    timesup(local=True)
 
 @app.route("/",methods=["POST", "GET"])
 def index():
-    global state, last_on
+    global state, last_on, timer
     if(request.method == "POST"):
         resp = request.get_json()
 
+        if "message" not in resp:
+            return "QQ"
+
         chatid = resp["message"]["chat"]["id"]
 
-        if str(chatid) not in (CHAT_ID0, CHAT_ID1):
+        if str(chatid) not in [CHAT_ID0, CHAT_ID1] + CHAT_IDs:
             send(chatid, 'Unauthorized user!')
             return "Done"
 
-        msgtext = resp["message"]["text"]
-        logger.debug("Text: " + msgtext)
-        sendername = resp["message"]["from"]["first_name"]
-        logger.debug("Name: " + sendername)
+        try:
+            msgtext = resp["message"]["text"]
+            logger.debug("Text: " + msgtext)
+            sendername = resp["message"]["from"]["first_name"]
+            logger.debug("Name: " + sendername)
+        except:
+            print(resp)
+            msgtext = ""
 
         if msgtext.startswith("/pump_on"):
-            resp = requests.get(f'http://{HOST}/H')
+            resp = s.get(f'http://{HOST}/H')
             logging.debug(resp.text)
             state = True
             last_on = datetime.now()
-            Timer(on_time.seconds, timesup_local).start()
-            send(chatid, 'State set to ON.')
+            if isinstance(timer, Timer):
+                timer.cancel()
+            timer = Timer(on_time.seconds, timesup_local)
+            timer.start()
+            send(chatid, f'Set pump to ON for {on_mins} minutes.')
             logging.info('State set to ON.')
         elif msgtext.startswith("/pump_off"):
-            resp = requests.get(f'http://{HOST}/L')
+            resp = s.get(f'http://{HOST}/L')
             logging.debug(resp.text)
             state = False
-            send(chatid, 'State set to OFF.')
+            if isinstance(timer, Timer):
+                timer.cancel()
+            send(chatid, 'Pump set to OFF.')
             logging.info('State set to OFF.')
         elif msgtext.startswith("/state"):
+            resp = s.get(f'http://{HOST}/')
+            status = resp.text.replace('\r\n', '')
+            if status.isnumeric():
+                state = True
+            else: # status == "OFF":
+                state = False
+
             if state == True:
-                if (last_on + on_time - datetime.now()).days < 0:
+                timeleft = (on_time - timedelta(seconds=int(status)/1000))
+                if timeleft.days < 0:
                     timeleft = "0.0"
                 else:
-                    timeleft = f'{(last_on + on_time - datetime.now()).seconds / 60:.1f}'
+                    timeleft = f'{timeleft.seconds / 60:.1f}'
                 send(chatid, f'Pump is ON, {timeleft} minutes left.')
             else:
                 send(chatid, "Pump is OFF.")
@@ -119,4 +153,5 @@ def index():
     return "Hi!"
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=8080)
+    app.run(debug=True, host="0.0.0.0", port=8087)
+
